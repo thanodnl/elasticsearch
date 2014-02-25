@@ -25,6 +25,7 @@ import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.search.aggregations.AggregationExecutionException;
 import org.elasticsearch.search.aggregations.Aggregator;
 import org.elasticsearch.search.aggregations.bucket.MultiBucketsAggregation;
+import org.elasticsearch.search.aggregations.bucket.SingleBucketAggregator;
 import org.elasticsearch.search.aggregations.metrics.MetricsAggregator;
 
 import java.io.IOException;
@@ -125,18 +126,12 @@ class InternalOrder extends Terms.Order {
         if (!(order instanceof Aggregation)) {
             return order;
         }
-        String aggName = ((Aggregation) order).aggName();
-        Aggregator[] subAggregators = termsAggregator.subAggregators();
-        for (int i = 0; i < subAggregators.length; i++) {
-            Aggregator aggregator = subAggregators[i];
-            if (aggregator.name().equals(aggName)) {
-
-                // we can only apply order on metrics sub-aggregators
-                if (!(aggregator instanceof MetricsAggregator)) {
-                    throw new AggregationExecutionException("terms aggregation [" + termsAggregator.name() + "] is configured to order by sub-aggregation ["
-                            + aggName + "] which is is not a metrics aggregation. Terms aggregation order can only refer to metrics aggregations");
-                }
-
+        Aggregation aggregationOrder = ((Aggregation) order); 
+        String aggName = aggregationOrder.aggName();
+        Aggregator aggregator = aggregationOrder.subAggregator(aggName, termsAggregator);
+        if (aggregator != null) {
+            // we can only apply order on metrics sub-aggregators
+            if (aggregator instanceof MetricsAggregator) {
                 if (aggregator instanceof MetricsAggregator.MultiValue) {
                     String valueName = ((Aggregation) order).metricName();
                     if (valueName == null) {
@@ -149,11 +144,27 @@ class InternalOrder extends Terms.Order {
                     }
                     return order;
                 }
-
                 // aggregator must be of a single value type
                 // todo we can also choose to be really strict and verify that the user didn't specify a value name and if so fail?
                 return order;
             }
+            if (aggregator instanceof SingleBucketAggregator) {
+                String valueName = ((Aggregation) order).metricName();
+                if ("_count".equals(valueName)) {
+                    return order;
+                }
+                
+                Aggregator valueAggregator = aggregationOrder.subAggregator(valueName, aggregator);
+                if (valueAggregator != null && valueAggregator instanceof MetricsAggregator) {
+                    return order;
+                }
+                
+                throw new AggregationExecutionException("The aggregation [" + termsAggregator.name() + "] is configured to sort on [" + valueName + "] but is not supported.");
+            }
+                
+            // TODO change error message
+            throw new AggregationExecutionException("terms aggregation [" + termsAggregator.name() + "] is configured to order by sub-aggregation ["
+                    + aggName + "] which is is not a metrics aggregation. Terms aggregation order can only refer to metrics aggregations: " + aggregator.getClass().getName());
         }
 
         throw new AggregationExecutionException("terms aggregation [" + termsAggregator.name() + "] is configured with a sub-aggregation order ["
@@ -173,12 +184,12 @@ class InternalOrder extends Terms.Order {
         }
 
         String aggName() {
-            int index = key.indexOf('.');
+            int index = key.lastIndexOf('.');
             return index < 0 ? key : key.substring(0, index);
         }
 
         String metricName() {
-            int index = key.indexOf('.');
+            int index = key.lastIndexOf('.');
             return index < 0 ? null : key.substring(index + 1, key.length());
         }
 
@@ -201,7 +212,7 @@ class InternalOrder extends Terms.Order {
             // attached to the order will still be used in the reduce phase of the Aggregation.
 
             final Aggregator aggregator = subAggregator(aggName(), termsAggregator);
-            assert aggregator != null && aggregator instanceof MetricsAggregator : "this should be picked up before the aggregation is executed";
+            //assert aggregator != null && aggregator instanceof MetricsAggregator : "this should be picked up before the aggregation is executed";
             if (aggregator instanceof MetricsAggregator.MultiValue) {
                 final String valueName = metricName();
                 assert valueName != null : "this should be picked up before the aggregation is executed";
@@ -219,6 +230,35 @@ class InternalOrder extends Terms.Order {
                     }
                 };
             }
+            
+            if (aggregator instanceof SingleBucketAggregator) {
+                if ("_count".equals(metricName())) {
+                    return new Comparator<Terms.Bucket>() {
+                        @Override
+                        public int compare(Terms.Bucket o1, Terms.Bucket o2) {
+                            long v1 = ((SingleBucketAggregator) aggregator).bucketDocCount(((InternalTerms.Bucket) o1).bucketOrd);
+                            long v2 = ((SingleBucketAggregator) aggregator).bucketDocCount(((InternalTerms.Bucket) o2).bucketOrd);
+                            
+                            return ((int)Math.min(1, Math.max((v1-v2), -1))) * ( asc ? 1 : -1);
+                        }
+                    };
+                } else {
+                    return new Comparator<Terms.Bucket>() {
+                        final MetricsAggregator.SingleValue localAggregator = (MetricsAggregator.SingleValue) subAggregator(metricName(), aggregator);
+                        @Override
+                        public int compare(Terms.Bucket o1, Terms.Bucket o2) {
+                            double v1 = localAggregator.metric(((InternalTerms.Bucket) o1).bucketOrd);
+                            double v2 = localAggregator.metric(((InternalTerms.Bucket) o2).bucketOrd);
+                            // some metrics may return NaN (eg. avg, variance, etc...) in which case we'd like to push all of those to
+                            // the bottom
+                            if (v1 == Double.NaN) {
+                                return asc ? 1 : -1;
+                            }
+                            return asc ? Double.compare(v1, v2) : Double.compare(v2, v1);
+                        }
+                    };
+                }
+            }
 
             return new Comparator<Terms.Bucket>() {
                 @Override
@@ -235,14 +275,22 @@ class InternalOrder extends Terms.Order {
             };
         }
 
-        private Aggregator subAggregator(String aggName, Aggregator termsAggregator) {
-            Aggregator[] subAggregators = termsAggregator.subAggregators();
-            for (int i = 0; i < subAggregators.length; i++) {
-                if (subAggregators[i].name().equals(aggName)) {
-                    return subAggregators[i];
+        private Aggregator subAggregator(String aggName, Aggregator aggregator) {
+            String parts[] = aggName.split("\\.");
+            for (int i = 0; aggregator != null && i < parts.length; i++) {
+                Aggregator[] subAggregators = aggregator.subAggregators();
+                aggregator = null;
+                for (int j = 0; j < subAggregators.length; j++) {
+                    if (subAggregators[j].name().equals(parts[i])) {
+                        aggregator = subAggregators[j];
+                        break;
+                    }
+                }
+                if (aggregator == null) {
+                    break;
                 }
             }
-            return null;
+            return aggregator;
         }
     }
 

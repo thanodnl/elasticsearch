@@ -62,12 +62,13 @@ public interface MultiBucketsAggregation extends Aggregation {
         static class SubAggregationComparator<B extends Bucket> implements java.util.Comparator<B> {
 
             private final String aggName;
+            private final String[] aggNameParts;
             private final String valueName;
             private final boolean asc;
 
             public SubAggregationComparator(String expression, boolean asc) {
                 this.asc = asc;
-                int i = expression.indexOf('.');
+                int i = expression.lastIndexOf('.');
                 if (i < 0) {
                     this.aggName = expression;
                     this.valueName = null;
@@ -75,10 +76,12 @@ public interface MultiBucketsAggregation extends Aggregation {
                     this.aggName = expression.substring(0, i);
                     this.valueName = expression.substring(i+1);
                 }
+                this.aggNameParts = this.aggName.split("\\.");
             }
 
             public SubAggregationComparator(String aggName, String valueName, boolean asc) {
                 this.aggName = aggName;
+                this.aggNameParts = this.aggName.split("\\.");
                 this.valueName = valueName;
                 this.asc = asc;
             }
@@ -103,12 +106,35 @@ public interface MultiBucketsAggregation extends Aggregation {
             }
 
             private double value(B bucket) {
-                MetricsAggregation aggregation = bucket.getAggregations().get(aggName);
+                System.out.println(aggName + ": " + bucket.getKey());
+                Aggregation aggregation = bucket.getAggregations().get(aggNameParts[0]);
+                
+                if (aggNameParts.length > 1) {
+                    for (int i = 1; aggregation != null && i < aggNameParts.length; i++) {
+                        if (!(aggregation instanceof SingleBucketAggregation)) {
+                            throw new ElasticsearchIllegalArgumentException("Cannot traverse sub-aggregation [" + aggName + "] on depth " + i);
+                        }
+                        SingleBucketAggregation sba = (SingleBucketAggregation) aggregation;
+                        aggregation = sba.getAggregations().get(aggNameParts[i]);
+                    }
+                }
+                
                 if (aggregation == null) {
                     throw new ElasticsearchIllegalArgumentException("Unknown aggregation named [" + aggName + "]");
                 }
+                if (aggregation instanceof SingleBucketAggregation) {
+                    if ("_count".equals(valueName)) {
+                        return ((SingleBucketAggregation)aggregation).getDocCount();
+                    }
+                    aggregation = ((SingleBucketAggregation)aggregation).getAggregations().get(valueName);
+                    System.out.println("taking sub-agg " + valueName + " aggregation: " + aggregation);
+                    if (aggregation == null) {
+                        throw new ElasticsearchIllegalArgumentException("Cannot sort aggregation on [" + valueName + "].");
+                    }
+                }
                 if (aggregation instanceof MetricsAggregation.SingleValue) {
                     //TODO should we throw an exception if the value name is specified?
+                    System.out.println("Singlevalue");
                     return ((MetricsAggregation.SingleValue) aggregation).value();
                 }
                 if (aggregation instanceof MetricsAggregation.MultiValue) {

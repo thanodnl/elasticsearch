@@ -276,7 +276,7 @@ public class TermsParser implements Aggregator.Parser {
         if ("_count".equals(key)) {
             return asc ? InternalOrder.COUNT_ASC : InternalOrder.COUNT_DESC;
         }
-        int i = key.indexOf('.');
+        int i = key.lastIndexOf('.');
         if (i < 0) {
             return new InternalOrder.Aggregation(key, asc);
         }
